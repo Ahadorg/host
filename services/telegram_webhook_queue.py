@@ -101,7 +101,15 @@ class TelegramWebhookQueue:
         """Claim/reclaim an update ID. None means DB failure; False is a duplicate."""
         update_id = int(update_id)
         now_ns = time.time_ns()
-        conn = get_db_connection()
+        try:
+            conn = get_db_connection()
+        except Exception as exc:
+            # Pool exhausted or DB down — treat as transient unavailable, not spam
+            if "PoolError" in type(exc).__name__ or "exhausted" in str(exc).lower():
+                logger.debug("claim_update pool exhausted — transient unavailable")
+            else:
+                logger.warning("Could not claim Telegram webhook update (%s)", type(exc).__name__)
+            return None
         try:
             cur = conn.execute(
                 "INSERT INTO telegram_webhook_updates"
@@ -197,7 +205,14 @@ class TelegramWebhookQueue:
 
     def complete_update(self, update_id: int, claim: int) -> None:
         """Mark a claim complete and drop its temporary update body."""
-        conn = get_db_connection()
+        try:
+            conn = get_db_connection()
+        except Exception as exc:
+            if "PoolError" in type(exc).__name__ or "exhausted" in str(exc).lower():
+                logger.debug("complete_update pool exhausted — will be reclaimed by lease")
+            else:
+                logger.warning("Could not complete Telegram webhook claim (%s)", type(exc).__name__)
+            return
         try:
             conn.execute(
                 "UPDATE telegram_webhook_updates SET completed_at=?,payload=NULL "
@@ -219,7 +234,14 @@ class TelegramWebhookQueue:
         """Atomically reclaim durable pending updates whose worker lease expired."""
         now_ns = time.time_ns()
         cutoff = now_ns - self.lease_ns
-        conn = get_db_connection()
+        try:
+            conn = get_db_connection()
+        except Exception as exc:
+            if "PoolError" in type(exc).__name__ or "exhausted" in str(exc).lower():
+                logger.debug("reclaim pool exhausted — backing off")
+            else:
+                logger.warning("Could not reclaim pending Telegram updates (%s: %s)", type(exc).__name__, exc)
+            return []
         claimed = []
         try:
             rows = conn.execute(
@@ -254,7 +276,12 @@ class TelegramWebhookQueue:
         return claimed
 
     def _read_claim(self, update_id: int, claim: int):
-        conn = get_db_connection()
+        try:
+            conn = get_db_connection()
+        except Exception as exc:
+            if "PoolError" not in type(exc).__name__:
+                logger.warning("Could not load queued Telegram update %s (%s)", update_id, type(exc).__name__)
+            return None
         try:
             row = conn.execute(
                 "SELECT payload FROM telegram_webhook_updates "

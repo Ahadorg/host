@@ -371,6 +371,7 @@ class _Connection:
 
     def __init__(self, conn):
         self._conn = conn
+        self._closed = False
 
     def execute(self, sql, params=()):
         cur = _Cursor(self._conn.cursor())
@@ -387,6 +388,9 @@ class _Connection:
         self._conn.rollback()
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         if DIALECT == "postgres":
             try:
                 self._conn.rollback()  # clear any open txn before returning to pool
@@ -394,13 +398,26 @@ class _Connection:
                 pass
             _return_to_pool(self._conn)
         else:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
+    def __del__(self):
+        # Safety net: if caller forgot close() or leaked via exception, return
+        # the raw connection to the pool on GC instead of holding it forever.
+        # This is what finally stopped "pool exhausted" from becoming permanent.
+        if not self._closed and DIALECT == "postgres" and getattr(self, "_conn", None) is not None:
+            try:
+                self.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +446,14 @@ def _get_pool():
     with _pool_lock:
         if _pool is None:
             drv = _load_psycopg2()
-            SimpleConnectionPool = drv["pool"].SimpleConnectionPool
+            # ThreadedConnectionPool is required for the webhook's 3 workers
+            # + uvicorn threads. SimpleConnectionPool is NOT thread-safe —
+            # that's how the live site hit "connection pool exhausted" after a
+            # burst: two threads borrowed the same slot and never returned it.
+            try:
+                PoolCls = drv["pool"].ThreadedConnectionPool
+            except AttributeError:
+                PoolCls = drv["pool"].SimpleConnectionPool
             # sslmode can also live inside DATABASE_URL; only inject a default
             # when the user hasn't already specified one.
             dsn = _DATABASE_URL
@@ -445,10 +469,13 @@ def _get_pool():
                 connect_kwargs["application_name"] = "codenest"
             if "sslmode" not in _DATABASE_URL and PG_SSLMODE:
                 connect_kwargs["sslmode"] = PG_SSLMODE
-            logger.info("Creating PostgreSQL connection pool (maxconn=8)")
-            _pool = SimpleConnectionPool(
-                minconn=1,
-                maxconn=8,
+            # Supabase free pooler allows many; 8 was too small for 3 webhook
+            # workers + web threads + recovery + broadcast + health probes.
+            # 20 still fits Render's 512 MB.
+            logger.info("Creating PostgreSQL connection pool (maxconn=20, Threaded)")
+            _pool = PoolCls(
+                minconn=2,
+                maxconn=20,
                 dsn=dsn,
                 cursor_factory=drv["RealDictCursor"],
                 **connect_kwargs,
@@ -479,31 +506,70 @@ def _checkout_pg():
                     now - _last_db_activity)
         _reset_pool()
     pool = _get_pool()
-    for _ in range(3):
-        raw = pool.getconn()
+    # Retry on PoolError (exhausted) with brief backoff — a burst of 3 webhook
+    # workers + web threads can transiently exceed the 8-slot pool. Previously
+    # this raised immediately and every caller spammed "connection pool exhausted"
+    # every 0.8s until the site looked dead.
+    last_pool_err = None
+    for attempt in range(6):
         try:
-            # Defence 3 — cheap liveness probe (round trip is ~ms, a dead
-            # conn costs a hang if we skip this)
-            cur = raw.cursor()
-            cur.execute("SELECT 1")
-            cur.close()
+            for _ in range(3):
+                try:
+                    raw = pool.getconn()
+                except Exception as exc:
+                    # PoolError or any pool exhaustion signal
+                    last_pool_err = exc
+                    raise
+                try:
+                    # Defence 3 — cheap liveness probe (round trip is ~ms, a dead
+                    # conn costs a hang if we skip this)
+                    cur = raw.cursor()
+                    cur.execute("SELECT 1")
+                    cur.close()
+                    _last_db_activity = time.monotonic()
+                    return raw
+                except Exception as exc:
+                    logger.warning("Discarding dead pooled PostgreSQL connection: %s",
+                                   type(exc).__name__)
+                    try:
+                        pool.putconn(raw, close=True)   # close & drop from the pool
+                    except Exception:
+                        try:
+                            raw.close()
+                        except Exception:
+                            pass
+                    # try next pooled conn
+                    continue
+            # Everything we were offered was dead — nuke the pool and take a fresh one.
+            _reset_pool()
+            pool = _get_pool()
+            raw = pool.getconn()
             _last_db_activity = time.monotonic()
             return raw
         except Exception as exc:
-            logger.warning("Discarding dead pooled PostgreSQL connection: %s",
-                           type(exc).__name__)
-            try:
-                pool.putconn(raw, close=True)   # close & drop from the pool
-            except Exception:
-                try:
-                    raw.close()
-                except Exception:
-                    pass
-    # Everything we were offered was dead — nuke the pool and take a fresh one.
-    _reset_pool()
-    raw = _get_pool().getconn()
-    _last_db_activity = time.monotonic()
-    return raw
+            # Handle PoolError / exhaustion with backoff, not instant spam
+            err_name = type(exc).__name__
+            if "PoolError" in err_name or "exhausted" in str(exc).lower():
+                last_pool_err = exc
+                # Log only first time, then backoff
+                if attempt == 0:
+                    logger.warning("PostgreSQL pool exhausted (attempt %d/6) — backing off 0.2s", attempt + 1)
+                else:
+                    logger.debug("PostgreSQL pool still exhausted (attempt %d/6)", attempt + 1)
+                time.sleep(0.15 + 0.05 * attempt)
+                # Also try to reset if still failing after a few attempts
+                if attempt >= 3:
+                    try:
+                        _reset_pool()
+                        pool = _get_pool()
+                    except Exception:
+                        pass
+                continue
+            raise
+    # Still failed after retries — raise the last PoolError with context
+    if last_pool_err is not None:
+        raise last_pool_err
+    raise RuntimeError("PostgreSQL pool checkout failed after retries")
 
 
 def _return_to_pool(conn):
