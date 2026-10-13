@@ -861,14 +861,31 @@ def update_from_repo(user_id: int, ref: str, repo_url: str = None, entry=None,
     row = find_app(user_id, ref)
     if not row:
         return {"ok": False, "error": f"No app called “{ref}”. `/apps` lists yours."}
-    url = (repo_url or row.get("repo_url") or "").strip()
+    old_url = (row.get("repo_url") or "").strip()
+    url = (repo_url or old_url or "").strip()
     if not url:
         return {"ok": False,
                 "error": f"*{row['name']}* wasn't deployed from a repo, so there is "
                          f"no newer version to pull. `/update {row['name']}` and send "
                          f"the code or a `.zip` instead."}
+    # A NEW repo or branch was asked for: accept `owner/repo`, `github.com/...`,
+    # `/tree/<branch>` and `#<branch>`, and turn them into the https form the
+    # runner requires. The job id, folder and database stay exactly as they are.
+    changed_source = False
+    if repo_url and repo_url.strip():
+        from services import github_repo
+        o, r, b = github_repo.parse_repo(url)
+        if not o:
+            return {"ok": False,
+                    "error": "That doesn't look like a GitHub repo — expected "
+                             "`github.com/user/repo` or `user/repo/tree/branch`."}
+        url = github_repo.repo_url(o, r, b)
+        changed_source = url != old_url
     if entry is None:
-        entry = row.get("repo_entry") or ""
+        # The old entry file belongs to the old repo/branch; on a changed
+        # source let the runner detect it again instead of failing on a
+        # file that may not exist there.
+        entry = "" if changed_source else (row.get("repo_entry") or "")
     env = _row_env(row)
     rid = row.get("runner_job_id")
 
