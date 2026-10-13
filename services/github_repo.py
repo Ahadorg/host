@@ -214,6 +214,31 @@ def head_commit(owner: str, repo: str, branch: str = "") -> str:
     return _cached(f"head:{owner}/{repo}:{branch}", COMMIT_CACHE_S, fetch) or ""
 
 
+def list_branches(owner: str, repo: str, limit: int = 8) -> list:
+    """Branch names (main/master/dev first), or [] when GitHub won't say."""
+    if not owner or not repo:
+        return []
+
+    def fetch():
+        url = f"{API}/repos/{owner}/{repo}/branches"
+        try:
+            r = requests.get(url, headers=_headers(), timeout=TIMEOUT_S,
+                             params={"per_page": 50})
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning("github branches %s/%s: %s", owner, repo, exc)
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            return [str(b.get("name")) for b in (r.json() or []) if b.get("name")]
+        except Exception:                                          # noqa: BLE001
+            return None
+
+    names = _cached(f"branches:{owner}/{repo}", COMMIT_CACHE_S, fetch) or []
+    first = [n for n in ("main", "master", "dev", "develop") if n in names]
+    return (first + [n for n in names if n not in first])[:limit]
+
+
 def readme(owner: str, repo: str, branch: str = "", limit: int = 3500) -> str:
     """The repo's README as plain text (best effort), for the 📖 button."""
     if not owner or not repo:
