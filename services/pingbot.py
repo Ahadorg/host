@@ -4423,19 +4423,35 @@ def _send_repo_readme(chat_id, owner, repo, branch=""):
 # --------------------------------------------------------------------------
 # Staying current: the commit an app was built from, and the one after it
 # --------------------------------------------------------------------------
-def _update_one_app(chat_id, user, row, force=False):
+def _update_one_app(chat_id, user, row, force=False, new_url=""):
     """Redeploy one app from its branch's HEAD, in place.
 
     In place means the runner keeps the job id, the folder and the public
     address, so the bot's database and sessions survive — which is the whole
     difference between "updated" and "reinstalled and lost my data".
     """
-    owner, repo, branch = github_repo.parse_repo(row.get("repo_url") or "")
     name = row["name"]
+    old_owner, old_repo, old_branch = github_repo.parse_repo(row.get("repo_url") or "")
+    target = (row.get("repo_url") or "")
+    if new_url:
+        # `/latest name <repo or branch>` — switch the app to another repo or
+        # branch. In place: same job, same folder, so its database survives.
+        if new_url.startswith("#"):
+            if not old_owner:
+                _send(chat_id, f"❌ *{name}* has a repo address I can't read, so "
+                               f"I can't tell which repo that branch belongs to.")
+                return
+            target = github_repo.repo_url(old_owner, old_repo, new_url[1:].strip())
+        else:
+            target = new_url
+    owner, repo, branch = github_repo.parse_repo(target)
     if not owner:
-        _send(chat_id, f"❌ *{name}* has a repo address I can't read: "
-                       f"`{row.get('repo_url')}`.")
+        _send(chat_id, f"❌ I can't read that repo address: `{target}`.")
         return
+    switching = bool(new_url) and (
+        (owner, repo, branch) != (old_owner, old_repo, old_branch))
+    if switching:
+        force = True
     with _working(chat_id):
         head = github_repo.head_commit(owner, repo, branch)
     current = (row.get("repo_commit") or "").strip()
@@ -4446,10 +4462,31 @@ def _update_one_app(chat_id, user, row, force=False):
     if head == current and not force:
         _send(chat_id, f"✅ *{name}* is already on the latest commit (`{head[:7]}`).")
         return
-    _send(chat_id, f"⬆️ *{name}*: `{(current or 'unknown')[:7]}` → `{head[:7]}` — "
-                   f"redeploying in place (same address, same data)…")
+    if switching:
+        _send(chat_id, f"🔀 *{name}* → `{owner}/{repo}`"
+                       + (f" (branch `{branch}`)" if branch else "")
+                       + f" at `{head[:7]}` — redeploying in place "
+                         f"(same address, same data)…")
+    else:
+        _send(chat_id, f"⬆️ *{name}*: `{(current or 'unknown')[:7]}` → `{head[:7]}` — "
+                       f"redeploying in place (same address, same data)…")
+    entry, deps = None, None
+    if switching:
+        # Which file runs in the NEW repo/branch: keep the old entry if it
+        # still exists there, take the only project if there is just one,
+        # otherwise let the runner detect it.
+        entry = ""
+        with _working(chat_id):
+            projects = github_repo.scan_projects(owner, repo, branch)
+        old_entry = (row.get("repo_entry") or "").strip()
+        match = [pr for pr in projects if pr["entry"] == old_entry]
+        pick = match[0] if match else (projects[0] if len(projects) == 1 else None)
+        if pick:
+            entry, deps = pick["entry"], pick["manifests"]
     with _working(chat_id):
-        res = bot_ops.update_from_repo(user["id"], name)
+        res = bot_ops.update_from_repo(
+            user["id"], name,
+            repo_url=(target if switching else None), entry=entry, deps=deps)
     if not res.get("ok"):
         _send(chat_id, f"❌ {res.get('error')}")
         return
@@ -4462,7 +4499,8 @@ def _update_one_app(chat_id, user, row, force=False):
 
 
 def cmd_latest(chat_id, user, ref=""):
-    """`/latest [name]` — bring a repo app up to date with its branch."""
+    """`/latest [name] [new repo or #branch]` — update a repo app, or move it to
+    another repo/branch. The app keeps its job, folder and database."""
     apps = [a for a in bot_ops.list_apps(user["id"]) if (a.get("repo_url") or "").strip()]
     if not apps:
         _send(chat_id, "None of your apps came from a repo, so there is no commit to "
@@ -4471,11 +4509,22 @@ def cmd_latest(chat_id, user, ref=""):
                           if _user_is_queen(user) else "."))
         return
     if ref:
+        # `/latest name`                       → newest commit of the same branch
+        # `/latest name https://github.com/u/r/tree/dev` → switch repo/branch
+        # `/latest name #dev`                  → switch branch, same repo
+        new_url = ""
+        toks = ref.split()
+        last = toks[-1] if toks else ""
+        if len(toks) > 1 and (
+                "github.com" in last.lower() or last.startswith("#")
+                or re.match(r"^[\w.-]+/[\w.-]+(?:[/#].*)?$", last)):
+            new_url = last
+            ref = " ".join(toks[:-1])
         row = bot_ops.find_app(user["id"], ref)
         if not row or not (row.get("repo_url") or "").strip():
             _send(chat_id, f"❌ No repo-backed app called “{ref}”. `/apps` lists yours.")
             return
-        _update_one_app(chat_id, user, row)
+        _update_one_app(chat_id, user, row, new_url=new_url)
         return
     if len(apps) == 1:
         _update_one_app(chat_id, user, apps[0])
