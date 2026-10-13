@@ -3775,7 +3775,8 @@ def _app_buttons(job_id, url="", bot_username="", repo=False, queen=False):
     # same idea as a platform auto-deploy, and the reason nobody has to remember
     # which commit is running.
     if repo:
-        rows.append([{"text": "⬆️ Deploy latest commit", "callback_data": f"latest:{job_id}"}])
+        rows.append([{"text": "⬆️ Deploy latest commit", "callback_data": f"latest:{job_id}"},
+                     {"text": "🔀 Repo / branch", "callback_data": f"latestsrc:{job_id}"}])
         if queen:
             rows.append([{"text": "⚙️ Auto-deploy: on/off",
                           "callback_data": f"autodep:{job_id}"}])
@@ -4498,6 +4499,59 @@ def _update_one_app(chat_id, user, row, force=False, new_url=""):
           reply_markup=_app_buttons(row["id"], repo=True, queen=_user_is_queen(user)))
 
 
+def _latest_menu(chat_id, user, row):
+    """The one screen /latest shows: what is running, and what can be done."""
+    owner, repo, branch = github_repo.parse_repo(row.get("repo_url") or "")
+    commit = (row.get("repo_commit") or "").strip()
+    _send(chat_id,
+          f"🔁 *{row['name']}*\n"
+          f"Repo: `{owner}/{repo}`" + (f" · branch `{branch}`" if branch else " · default branch")
+          + (f"\nRunning: `{commit[:7]}`" if commit else "")
+          + "\n\nYour data and address stay the same either way.",
+          reply_markup={"inline_keyboard": [
+              [{"text": "⬆️ Update to latest commit", "callback_data": f"latest:{row['id']}"}],
+              [{"text": "🔀 Change repo / branch", "callback_data": f"latestsrc:{row['id']}"}]]})
+
+
+def _latest_src_start(chat_id, user, row):
+    """Ask where the app should come from now: branch buttons, or a pasted link."""
+    owner, repo, branch = github_repo.parse_repo(row.get("repo_url") or "")
+    with _working(chat_id):
+        branches = github_repo.list_branches(owner, repo) if owner else []
+    _pending[chat_id] = {
+        "mode": "latest_src", "user": user, "user_id": user["id"],
+        "job_id": row["id"], "ref": row["name"], "branches": branches,
+        "owner": owner, "repo": repo,
+        "expires": time.time() + _PENDING_TTL_S,
+    }
+    rows = [[{"text": ("✅ " if b == branch else "🌿 ") + b[:40],
+              "callback_data": f"latestbr:{i}"}] for i, b in enumerate(branches)]
+    rows.append([{"text": "✖️ Cancel", "callback_data": "latestcancel:"}])
+    _send(chat_id,
+          f"🔀 *{row['name']}* — where should it come from?\n"
+          + ("Tap a branch of this repo, or " if branches else "")
+          + "send a GitHub link for another repo or branch:\n"
+            "`github.com/user/repo` or `github.com/user/repo/tree/dev`",
+          reply_markup={"inline_keyboard": rows})
+
+
+def _latest_src_apply(chat_id, pending, text):
+    """Run the switch the person asked for, then clear the slot."""
+    _pending.pop(chat_id, None)
+    user = pending["user"]
+    row = bot_ops.find_app(user["id"], str(pending["job_id"]))
+    if not row:
+        _send(chat_id, "❌ That app is not yours or no longer exists.")
+        return
+    t = (text or "").strip()
+    if t and "/" not in t and "github" not in t.lower() and not t.startswith("#"):
+        t = "#" + t                      # a bare word is a branch of this repo
+    if not t:
+        _send(chat_id, "I need a GitHub link or a branch name. `/latest` to start again.")
+        return
+    _update_one_app(chat_id, user, row, new_url=t)
+
+
 def cmd_latest(chat_id, user, ref=""):
     """`/latest [name] [new repo or #branch]` — update a repo app, or move it to
     another repo/branch. The app keeps its job, folder and database."""
@@ -4524,15 +4578,18 @@ def cmd_latest(chat_id, user, ref=""):
         if not row or not (row.get("repo_url") or "").strip():
             _send(chat_id, f"❌ No repo-backed app called “{ref}”. `/apps` lists yours.")
             return
-        _update_one_app(chat_id, user, row, new_url=new_url)
+        if new_url:
+            _update_one_app(chat_id, user, row, new_url=new_url)
+        else:
+            _latest_menu(chat_id, user, row)
         return
     if len(apps) == 1:
-        _update_one_app(chat_id, user, apps[0])
+        _latest_menu(chat_id, user, apps[0])
         return
-    rows = [[{"text": f"⬆️ {a['name']}", "callback_data": f"latest:{a['id']}"}]
+    rows = [[{"text": f"🔁 {a['name']}", "callback_data": f"latestmenu:{a['id']}"}]
             for a in apps[:8]]
-    _send(chat_id, "🔎 *Which app should I update?*\nEach one is redeployed from the "
-                   "commit its branch points at right now.",
+    _send(chat_id, "🔎 *Which app?*\nThen choose: update to the latest commit, or "
+                   "switch it to another repo / branch.",
           reply_markup={"inline_keyboard": rows})
 
 
@@ -4972,6 +5029,9 @@ def handle_pending_code(chat_id, msg, pending):
     # place wrong, easy to mistype. This way the runner still only ever
     # reads that same comment line (nothing changes downstream) — it's
     # just the bot's job to write it correctly, not the user's.
+    if pending.get("mode") == "latest_src":
+        _latest_src_apply(chat_id, pending, msg.get("text") or "")
+        return
     if pending.get("step") == "requirements":
         text = (msg.get("text") or "").strip()
         if text and text.lower() != "/skip":
@@ -5351,6 +5411,27 @@ def handle_callback(chat_id, data, message_id=None):
                            f"its code.")
         else:
             _update_one_app(chat_id, user, row)
+    elif action in ("latestmenu", "latestsrc"):
+        row = bot_ops.find_app(user["id"], ref)
+        if not row or not (row.get("repo_url") or "").strip():
+            _send(chat_id, "❌ That app is not yours, or it didn't come from a repo.")
+        elif action == "latestmenu":
+            _latest_menu(chat_id, user, row)
+        else:
+            _latest_src_start(chat_id, user, row)
+    elif action == "latestbr":
+        pend = _get_pending(chat_id)
+        try:
+            branch = (pend or {}).get("branches", [])[int(ref)]
+        except (ValueError, IndexError):
+            branch = ""
+        if not pend or pend.get("mode") != "latest_src" or not branch:
+            _send(chat_id, "That choice expired — `/latest` to start again.")
+        else:
+            _latest_src_apply(chat_id, pend, "#" + branch)
+    elif action == "latestcancel":
+        _pending.pop(chat_id, None)
+        _send(chat_id, "❎ Cancelled.")
     elif action == "autodep":
         row = bot_ops.find_app(user["id"], ref)
         if not row:
