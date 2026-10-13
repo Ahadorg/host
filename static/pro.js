@@ -4883,6 +4883,8 @@ function selectJob(id) {
   if(cached){
     _showWorkspace(cached,false);
     const name=document.getElementById("jobName");if(name)name.value=cached.name||"";
+    const rp=document.getElementById("jobRepoUrl");if(rp)rp.value="";
+    _setRepoPlaceholder(cached);
     const lang=document.getElementById("jobLang");if(lang&&cached.language){lang.value=cached.language;_jobCmSetMode(cached.language);}
     if(Object.prototype.hasOwnProperty.call(cached,"code")){
       if(_jobCmGetValue()!==(cached.code||""))_jobCmSetValue(cached.code||"");
@@ -4914,6 +4916,7 @@ function deselectJob() {
   if (btn) delete btn.dataset.editingId;
   const n = document.getElementById("jobName"); if (n) n.value = "";
   const u = document.getElementById("jobRepoUrl"); if (u) u.value = "";
+  _setRepoPlaceholder(null);
   _jobCmSetValue("");
   _updateStats();
   _setHint("", "Ready");
@@ -5349,6 +5352,7 @@ function _initWbWiring() {
     _renderLogs("");
     const n = document.getElementById("jobName"); if (n) { n.value = ""; n.classList.remove("rs-inp-err"); }
     const u = document.getElementById("jobRepoUrl"); if (u) u.value = "";
+    _setRepoPlaceholder(null);
     const langEl = document.getElementById("jobLang");
     if (langEl) { langEl.value = "python"; _jobCmSetMode("python"); }
     _jobCmSetValue("");
@@ -5489,7 +5493,13 @@ function _initWbWiring() {
     }
   };
   if (nameField) nameField.addEventListener("keydown", _enterRun);
-  if (repoField) repoField.addEventListener("keydown", _enterRun);
+  if (repoField) repoField.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.keyCode === 13) {
+      const b = document.getElementById("btnStartJob");
+      if (b && b.dataset.editingId) { e.preventDefault(); e.stopPropagation(); updateJobFromRepo(); return; }
+    }
+    _enterRun(e);
+  });
   // Escape closes the Details page (the old dropdown it also handled no
   // longer exists — downloads are plain buttons now).
   document.addEventListener("keydown", (e) => {
@@ -5674,6 +5684,7 @@ function _initWbWiring() {
     const u = ((document.getElementById("jobRepoUrl") || {}).value || "").trim();
     if (!u) { toast("Paste a GitHub repo URL first", "warn"); return; }
     const real = document.getElementById("btnStartJob");
+    if (real && real.dataset.editingId) { updateJobFromRepo(); return; }
     if (real) real.click();
   }
   const btnGh = document.getElementById("btnImportGh");
@@ -6540,6 +6551,68 @@ async function saveJobCode() {
       saveBtn.disabled = false;
       saveBtn.classList.remove("loading");
     }
+  }
+}
+
+/* UPDATE FROM REPO / BRANCH
+ * An existing bot can be re-pointed at another repo, another branch or a
+ * newer commit without being recreated. Only repo_url is sent (no code, no
+ * env), so the server keeps the saved env/token, and the runner re-clones
+ * while keeping the bot's data files (database.db, session.json, ...).
+ * Accepted: https://github.com/o/r | .../tree/<branch> | ...#<branch> */
+async function updateJobFromRepo() {
+  const btn = document.getElementById("btnStartJob");
+  const editingId = btn && btn.dataset.editingId;
+  if (!editingId) { toast("Open a bot first", "error"); return; }
+  const cur = (window._lastJobs || []).find(j => String(j.id) === String(editingId)) || {};
+  const inp = document.getElementById("jobRepoUrl");
+  const repoUrl = ((inp && inp.value) || "").trim() || (cur.repo_url || "").trim();
+  if (!repoUrl) { toast("Paste a GitHub repo / branch URL first", "warn"); if (inp) inp.focus(); return; }
+  if (!/^https?:\/\/github\.com\//i.test(repoUrl)) { toast("Only github.com URLs are supported", "error"); return; }
+  if (!confirm("Update this bot from:\n" + repoUrl + "\n\nYour database and saved data files will be kept.")) return;
+  const gh = document.getElementById("btnImportGh");
+  if (gh) { gh.disabled = true; gh.classList.add("loading"); }
+  if (typeof rsRunState === "function") rsRunState("saving");
+  _setHint("warn", "");
+  try {
+    const nameEl = document.getElementById("jobName");
+    const langEl = document.getElementById("jobLang");
+    const payload = {
+      name: ((nameEl && nameEl.value) || cur.name || "").trim() || undefined,
+      language: (langEl && langEl.value) || cur.language || "python",
+      repo_url: repoUrl,
+    };
+    await api("/api/jobs/" + editingId, "PATCH", payload, true);
+    toast("Updated from repo \u2713", "success");
+    _setHint("ok", "");
+    _jobDirty = false;
+    if (inp) inp.value = "";
+    if (typeof rsRunState === "function") rsRunState("starting");
+    await loadJobs();
+    try { _lastJobsSig = ""; const j = (window._lastJobs || []).find(x => String(x.id) === String(editingId)); if (j) _setRepoPlaceholder(j); } catch (e) {}
+    try { _reflectJobStatus(editingId); } catch (e) {}
+  } catch (e) {
+    toast(e.message, "error");
+    _setHint("err", "update failed");
+    try { _reflectJobStatus(editingId); } catch (_) {}
+  } finally {
+    if (gh) { gh.disabled = false; gh.classList.remove("loading"); }
+  }
+}
+
+/* Show which repo/branch the open bot is running from. The field itself stays
+   empty on purpose: a pre-filled value would make every Save & Run re-clone. */
+function _setRepoPlaceholder(job) {
+  const inp = document.getElementById("jobRepoUrl");
+  if (!inp) return;
+  if (!inp.dataset.defaultPh) inp.dataset.defaultPh = inp.placeholder || "Import from a GitHub repo\u2026";
+  inp.placeholder = (job && job.repo_url)
+    ? "Current: " + job.repo_url + " \u2014 paste new repo/branch, then \u2193 to update"
+    : inp.dataset.defaultPh;
+  const gh = document.getElementById("btnImportGh");
+  if (gh) {
+    const t = job ? "Update from repo / branch" : "Import repository";
+    gh.title = t; gh.setAttribute("aria-label", t);
   }
 }
 
