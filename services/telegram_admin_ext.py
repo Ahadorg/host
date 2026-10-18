@@ -12,12 +12,20 @@ website query — see the matching route in routes/admin.py in each
 docstring — so behaviour stays consistent between the two surfaces.
 """
 
+import ipaddress
+import logging
+import socket
+import time
+from urllib.parse import urlparse
+
 from database import get_db_connection
 from services import runner_client
 from services import bot_ops
 from routes.deps import now_utc_str
 
 ADMIN_HEALTH_MAX_AGE_S = 30
+
+logger = logging.getLogger("codenest-telegram-admin-ext")
 
 
 # ── Telegram-level ban — new, not on the website ────────────────────────
@@ -293,6 +301,7 @@ def delete_runner(runner_id: int) -> dict:
             return {"ok": False, "error": "No such runner."}
         conn.execute("DELETE FROM runner_nodes WHERE id=?", (runner_id,))
         conn.commit()
+        runner_client.invalidate_runner_registry()
         return {"ok": True, "label": row["label"]}
     finally:
         conn.close()
@@ -586,36 +595,112 @@ def runners_overview(refresh: bool = False) -> dict:
     return {"runners": rows, "embedded": embedded}
 
 
-def add_runner(label: str, url: str, secret: str, created_by: int) -> dict:
-    """Same validation the website's 'Add runner' does, before ever saving:
-    1) GET /health must return 200 — proves the service is even up.
-    2) An authenticated call must succeed with the given secret — proves
-       the secret actually matches RUNNER_SERVICE_SECRET on that Render
-       service, not just that the URL responds to something.
-    Only then is it written to runner_nodes (the column keeps its old name;
-    what is stored in it is plain JSON — see services/secrets_store.py)."""
+_TRANSIENT_STATUSES = (408, 425, 429, 500, 502, 503, 504)
+
+
+def _validate_runner_url(url: str) -> str:
+    """Same URL rules as the website's 'Add runner'. Returns '' when fine,
+    otherwise a human-readable error."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        return "Paste the runner's public https:// URL (e.g. https://my-runner.onrender.com)."
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, 443)}
+        if not addresses or any(ipaddress.ip_address(ip).is_private
+                                or ipaddress.ip_address(ip).is_loopback
+                                or ipaddress.ip_address(ip).is_link_local
+                                for ip in addresses):
+            raise ValueError("private address")
+    except (OSError, ValueError):
+        return "Runner URL must resolve to a public service."
+    return ""
+
+
+def _fallback_admin_id(conn):
+    """created_by is NOT NULL (and a foreign key to users). The chat's own
+    account is used when it exists; the owner of the Telegram super-admin id
+    often has no linked site account, so fall back to a real admin user."""
+    row = conn.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1").fetchone()
+    if not row:
+        row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+    return row["id"] if row else None
+
+
+def add_runner(label: str, url: str, secret: str, created_by) -> dict:
+    """Same validation and same writes as the website's 'Add runner'
+    (routes/admin.py admin_add_runner):
+    1) URL must be a public https:// address.
+    2) GET /health must return 200 (retried — a sleeping Render free
+       service answers 502/503 while it wakes up).
+    3) An authenticated call must succeed with the given secret.
+    Only then is it written to runner_nodes. Never raises: every failure
+    comes back as {"ok": False, "error": ...} so the chat always answers."""
     import requests as _requests
     from services import secrets_store
-    url = url.rstrip("/")
-    try:
-        health = _requests.get(url + "/health", timeout=12)
-    except _requests.RequestException as exc:
-        return {"ok": False, "error": f"Couldn't reach {url}/health: {exc}"}
+
+    label = (label or "").strip()[:60] or "Runner"
+    url = (url or "").strip().rstrip("/")
+    secret = (secret or "").strip()
+    if not secret:
+        return {"ok": False, "error": "The runner secret is empty."}
+    bad_url = _validate_runner_url(url)
+    if bad_url:
+        return {"ok": False, "error": bad_url}
+
+    health = None
+    for attempt in range(4):
+        try:
+            health = _requests.get(url + "/health", timeout=12)
+            if health.status_code == 200:
+                break
+            if health.status_code not in _TRANSIENT_STATUSES:
+                break
+        except _requests.RequestException:
+            pass
+        if attempt < 3:
+            time.sleep(2)
+    if health is None:
+        return {"ok": False, "error": "Runner is unreachable after four attempts. Confirm the "
+                                       "Render service is Live, then open its /health URL."}
     if health.status_code != 200:
-        return {"ok": False, "error": f"{url}/health returned HTTP {health.status_code}, expected 200."}
+        if health.status_code == 404:
+            detail = ("The /health endpoint returned 404. Deploy the repository with Root "
+                      "Directory set to runner, not the main website.")
+        elif health.status_code in (502, 503, 504):
+            detail = ("Render is still starting the runner. Open /health until it returns "
+                      "status 200, then try again.")
+        else:
+            detail = f"{url}/health returned HTTP {health.status_code}, expected 200."
+        return {"ok": False, "error": detail}
     try:
         auth_check = _requests.get(url + "/internal/jobs",
-                                    headers={"Authorization": "Bearer " + secret}, timeout=12)
+                                   headers={"Authorization": "Bearer " + secret}, timeout=12)
     except _requests.RequestException:
         return {"ok": False, "error": "Health works, but the authenticated endpoint did not respond."}
     if auth_check.status_code in (401, 403):
         return {"ok": False, "error": "Runner is healthy, but that secret doesn't match "
                                        "RUNNER_SERVICE_SECRET on that Render service."}
+    if auth_check.status_code == 503:
+        try:
+            remote_detail = str((auth_check.json() or {}).get("detail") or "")
+        except Exception:
+            remote_detail = ""
+        if "secret not configured" in remote_detail.lower():
+            return {"ok": False, "error": "Runner is healthy, but RUNNER_SERVICE_SECRET is missing in "
+                                           "the runner's Render Environment. Add it there and redeploy."}
     if auth_check.status_code != 200:
         return {"ok": False, "error": f"Auth check returned HTTP {auth_check.status_code}, expected 200."}
 
+    try:
+        had_remote_pool = bool(runner_client.runner_pool())
+    except Exception:
+        had_remote_pool = True
     conn = get_db_connection()
     try:
+        owner_id = created_by or _fallback_admin_id(conn)
+        if not owner_id:
+            return {"ok": False, "error": "No site account exists yet to own this runner. "
+                                           "Sign up on the website once, then try again."}
         existing = conn.execute("SELECT id FROM runner_nodes WHERE url=?", (url,)).fetchone()
         now = now_utc_str()
         stored_secret = secrets_store.pack_env({"secret": secret})
@@ -626,11 +711,27 @@ def add_runner(label: str, url: str, secret: str, created_by: int) -> dict:
         else:
             cur = conn.execute(
                 "INSERT INTO runner_nodes (label,url,encrypted_secret,enabled,created_by,created_at,updated_at) "
-                "VALUES (?,?,?,1,?,?,?)", (label, url, stored_secret, created_by, now, now))
+                "VALUES (?,?,?,1,?,?,?)", (label, url, stored_secret, owner_id, now, now))
             node_id = cur.lastrowid
+        if not had_remote_pool:
+            # Keep jobs already running in the in-process engine addressable.
+            conn.execute("UPDATE jobs SET worker_url='embedded' "
+                         "WHERE worker_url IS NULL AND runner_job_id IS NOT NULL")
+        conn.execute(
+            "INSERT INTO admin_audit_log (admin_id, action, target, details, created_at) "
+            "VALUES (?,?,?,?,?)", (owner_id, "runner_add", url, label, now))
         conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.exception("add_runner: saving to the database failed")
+        return {"ok": False, "error": f"Runner checked OK, but saving it failed: "
+                                       f"{type(exc).__name__}: {str(exc)[:200]}"}
     finally:
         conn.close()
+    runner_client.invalidate_runner_registry()
     return {"ok": True, "id": node_id, "label": label}
 
 
@@ -642,8 +743,10 @@ def toggle_runner(runner_id: int) -> dict:
         if not row:
             return None
         new_val = 0 if row["enabled"] else 1
-        conn.execute("UPDATE runner_nodes SET enabled=? WHERE id=?", (new_val, runner_id))
+        conn.execute("UPDATE runner_nodes SET enabled=?,updated_at=? WHERE id=?",
+                     (new_val, now_utc_str(), runner_id))
         conn.commit()
+        runner_client.invalidate_runner_registry()
         return {"id": row["id"], "label": row["label"], "enabled": new_val}
     finally:
         conn.close()
