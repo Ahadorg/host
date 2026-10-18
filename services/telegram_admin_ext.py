@@ -626,27 +626,16 @@ def _fallback_admin_id(conn):
     return row["id"] if row else None
 
 
-def add_runner(label: str, url: str, secret: str, created_by) -> dict:
-    """Same validation and same writes as the website's 'Add runner'
-    (routes/admin.py admin_add_runner):
-    1) URL must be a public https:// address.
-    2) GET /health must return 200 (retried — a sleeping Render free
-       service answers 502/503 while it wakes up).
-    3) An authenticated call must succeed with the given secret.
-    Only then is it written to runner_nodes. Never raises: every failure
-    comes back as {"ok": False, "error": ...} so the chat always answers."""
+def check_runner_url(url: str) -> dict:
+    """Step 1 of adding a runner: is this a public https URL whose /health
+    answers 200? Retried, because a sleeping Render free service answers
+    502/503 while it wakes. Returns {"ok": True, "url": clean_url} or
+    {"ok": False, "error": ...}."""
     import requests as _requests
-    from services import secrets_store
-
-    label = (label or "").strip()[:60] or "Runner"
     url = (url or "").strip().rstrip("/")
-    secret = (secret or "").strip()
-    if not secret:
-        return {"ok": False, "error": "The runner secret is empty."}
     bad_url = _validate_runner_url(url)
     if bad_url:
         return {"ok": False, "error": bad_url}
-
     health = None
     for attempt in range(4):
         try:
@@ -672,6 +661,17 @@ def add_runner(label: str, url: str, secret: str, created_by) -> dict:
         else:
             detail = f"{url}/health returned HTTP {health.status_code}, expected 200."
         return {"ok": False, "error": detail}
+    return {"ok": True, "url": url}
+
+
+def check_runner_secret(url: str, secret: str) -> dict:
+    """Step 2 of adding a runner: does this secret match RUNNER_SERVICE_SECRET
+    on that runner? Returns {"ok": True} or {"ok": False, "error": ...}."""
+    import requests as _requests
+    url = (url or "").strip().rstrip("/")
+    secret = (secret or "").strip()
+    if not secret:
+        return {"ok": False, "error": "The runner secret is empty."}
     try:
         auth_check = _requests.get(url + "/internal/jobs",
                                    headers={"Authorization": "Bearer " + secret}, timeout=12)
@@ -690,6 +690,32 @@ def add_runner(label: str, url: str, secret: str, created_by) -> dict:
                                            "the runner's Render Environment. Add it there and redeploy."}
     if auth_check.status_code != 200:
         return {"ok": False, "error": f"Auth check returned HTTP {auth_check.status_code}, expected 200."}
+    return {"ok": True}
+
+
+def add_runner(label: str, url: str, secret: str, created_by) -> dict:
+    """Same validation and same writes as the website's 'Add runner'
+    (routes/admin.py admin_add_runner):
+    1) URL must be a public https:// address.
+    2) GET /health must return 200 (retried — a sleeping Render free
+       service answers 502/503 while it wakes up).
+    3) An authenticated call must succeed with the given secret.
+    Only then is it written to runner_nodes. Never raises: every failure
+    comes back as {"ok": False, "error": ...} so the chat always answers."""
+    import requests as _requests
+    from services import secrets_store
+
+    url = (url or "").strip().rstrip("/")
+    label = (label or "").strip()[:60] or (urlparse(url).hostname or "Runner").split(".")[0][:60]
+    secret = (secret or "").strip()
+    if not secret:
+        return {"ok": False, "error": "The runner secret is empty."}
+    checked = check_runner_url(url)
+    if not checked.get("ok"):
+        return checked
+    checked = check_runner_secret(url, secret)
+    if not checked.get("ok"):
+        return checked
 
     try:
         had_remote_pool = bool(runner_client.runner_pool())
