@@ -1871,9 +1871,8 @@ _ADMIN_FLOW_TTL_S = 300
 
 ADMIN_FLOWS = {
     "addrunner": [
-        ("label", "Label for this runner? (a short name, e.g. `render-eu`)"),
-        ("url", "Its URL? (e.g. `https://my-runner.onrender.com`)"),
-        ("secret", "Its `RUNNER_SERVICE_SECRET`? ⚠️ delete this message after I confirm."),
+        ("url", "Send the runner's URL (e.g. `https://my-runner.onrender.com`)"),
+        ("secret", "✅ Runner is up. Now send its `RUNNER_SERVICE_SECRET` ⚠️ delete that message after I confirm."),
     ],
     "ban": [
         ("telegram_id", "Telegram id to ban? (the number, not a username)"),
@@ -1905,6 +1904,33 @@ ADMIN_FLOWS = {
 }
 
 
+def _flow_check_runner_url(chat_id, value, data):
+    """addrunner step 1: verify the URL right away, before asking for more."""
+    _send(chat_id, "🔎 Checking the runner… (a sleeping Render service can take up to a minute)")
+    res = telegram_admin_ext.check_runner_url(value)
+    if not res.get("ok"):
+        return False, f"❌ {res['error']}\nSend the URL again, or /cancel."
+    data["url"] = res["url"]
+    return True, ""
+
+
+def _flow_check_runner_secret(chat_id, value, data):
+    """addrunner step 2: verify the secret against that runner."""
+    res = telegram_admin_ext.check_runner_secret(data.get("url", ""), value)
+    if not res.get("ok"):
+        return False, f"❌ {res['error']}\nSend the secret again, or /cancel."
+    return True, "✅ Secret matches. Saving…"
+
+
+# (flow, field) -> check run on that answer BEFORE moving to the next question.
+# check(chat_id, value, data) -> (ok, message). On failure the same question is
+# asked again; on success the flow moves on.
+ADMIN_FLOW_VALIDATORS = {
+    ("addrunner", "url"): _flow_check_runner_url,
+    ("addrunner", "secret"): _flow_check_runner_secret,
+}
+
+
 def _start_admin_flow(chat_id, flow_name, extra=None):
     steps = ADMIN_FLOWS[flow_name]
     _admin_flow[chat_id] = {"flow": flow_name, "idx": 0, "data": {}, "extra": extra or {},
@@ -1922,7 +1948,21 @@ def _advance_admin_flow(chat_id, text):
         return False
     steps = ADMIN_FLOWS[state["flow"]]
     field, _ = steps[state["idx"]]
-    state["data"][field] = text.strip()
+    value = text.strip()
+    check = ADMIN_FLOW_VALIDATORS.get((state["flow"], field))
+    if check:
+        try:
+            ok, note = check(chat_id, value, state["data"])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("admin flow check failed (%s/%s)", state["flow"], field)
+            ok, note = False, f"❌ Check failed: {type(exc).__name__}. Try again, or /cancel."
+        if not ok:
+            state["expires"] = time.time() + _ADMIN_FLOW_TTL_S
+            _send(chat_id, note)
+            return True
+        if note:
+            _send(chat_id, note)
+    state["data"][field] = value
     state["idx"] += 1
     if state["idx"] < len(steps):
         state["expires"] = time.time() + _ADMIN_FLOW_TTL_S
@@ -1937,8 +1977,7 @@ def _run_admin_flow(chat_id, flow_name, data, extra=None):
     extra = extra or {}
     caller = telegram_link.user_for_chat(chat_id)  # private chat: chat_id == telegram user id
     if flow_name == "addrunner":
-        _send(chat_id, f"Checking {data['url']}…")
-        res = telegram_admin_ext.add_runner(data["label"], data["url"], data["secret"],
+        res = telegram_admin_ext.add_runner(data.get("label", ""), data["url"], data["secret"],
                                             caller["id"] if caller else None)
         _send(chat_id, f"✅ Runner “{res['label']}” registered (#{res['id']}) and enabled."
               if res.get("ok") else f"❌ {res['error']}")
