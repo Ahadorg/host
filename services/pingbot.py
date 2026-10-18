@@ -1872,7 +1872,7 @@ _ADMIN_FLOW_TTL_S = 300
 ADMIN_FLOWS = {
     "addrunner": [
         ("url", "Send the runner's URL (e.g. `https://my-runner.onrender.com`)"),
-        ("secret", "✅ Runner is up. Now send its `RUNNER_SERVICE_SECRET` ⚠️ delete that message after I confirm."),
+        ("secret", "✅ Runner is up. Now send its `RUNNER_SERVICE_SECRET` ⚠️ delete that message after I confirm.\nDon't have one yet? Send `gen` and I'll create a secret for you."),
     ],
     "ban": [
         ("telegram_id", "Telegram id to ban? (the number, not a username)"),
@@ -1915,10 +1915,27 @@ def _flow_check_runner_url(chat_id, value, data):
 
 
 def _flow_check_runner_secret(chat_id, value, data):
-    """addrunner step 2: verify the secret against that runner."""
+    """addrunner step 2: verify the secret against that runner.
+
+    `gen` makes a fresh secret and shows it (the flow stays on this step);
+    after the admin sets it on Render and redeploys, `ok` verifies that
+    generated secret."""
+    low = value.strip().lower()
+    if low in ("gen", "generate"):
+        import secrets as _secrets
+        data["gen_secret"] = _secrets.token_urlsafe(48)
+        return False, (
+            "🔑 New secret (tap to copy):\n\n`" + data["gen_secret"] + "`\n\n"
+            "1) Render → your runner service → Environment → set `RUNNER_SERVICE_SECRET` to this value.\n"
+            "2) Save and let it redeploy until /health works.\n"
+            "3) Send `ok` here and I'll verify it.\n"
+            "(Send `gen` again for a different one, or paste your own secret.)")
+    if low in ("ok", "done") and data.get("gen_secret"):
+        value = data["gen_secret"]
     res = telegram_admin_ext.check_runner_secret(data.get("url", ""), value)
     if not res.get("ok"):
-        return False, f"❌ {res['error']}\nSend the secret again, or /cancel."
+        return False, f"❌ {res['error']}\nSend the secret again (or `ok` to retry the generated one), or /cancel."
+    data["secret"] = value
     return True, "✅ Secret matches. Saving…"
 
 
@@ -1962,7 +1979,8 @@ def _advance_admin_flow(chat_id, text):
             return True
         if note:
             _send(chat_id, note)
-    state["data"][field] = value
+    if field not in state["data"]:      # a check may already have stored a cleaned value
+        state["data"][field] = value
     state["idx"] += 1
     if state["idx"] < len(steps):
         state["expires"] = time.time() + _ADMIN_FLOW_TTL_S
