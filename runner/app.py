@@ -2280,15 +2280,14 @@ def _isolation_tick() -> dict:
                            or (_proc_stats(proc) or {}).get("mem_mb") or 0.0)
                 candidates.append((mb, j))
             if not candidates:
-                # Only unlimited jobs left and the box is still full — pick the
-                # fattest anyway. Better one queen bot stops than the runner dies.
-                for j in items:
-                    proc = j.get("proc")
-                    if not proc or proc.poll() is not None or j.get("stop_requested"):
-                        continue
-                    mb = float((j.get("peak_mem_mb") or 0.0)
-                               or (_proc_stats(proc) or {}).get("mem_mb") or 0.0)
-                    candidates.append((mb, j))
+                # Queen (unlimited) jobs are NEVER culled here — they were promised 512MB.
+                # If the box is still over safe with only queen jobs left, we let the
+                # box ride over safe rather than kill a queen bot that was guaranteed
+                # to stay up. The real fix is queen-exclusive runners (512MB alone)
+                # — see choose_runner_for_user / queen_runner_pins — so this case
+                # should be rare (only when a queen is sharing a runner).
+                logger.warning("isolation: box at %.0fMB / %dMB safe but only queen jobs remain — leaving them alive", used_total, MEM_SAFE_MB)
+                candidates = []
             if candidates:
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 mb, j = candidates[0]

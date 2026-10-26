@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://ahadorg.onrender.com/</loc><priority>1.0</priority></url>
+  <url><loc>https://ahadorg.onrender.com/llms.txt</loc><priority>0.9</priority></url>
+  <url><loc>https://ahadorg.onrender.com/llms-full.txt</loc><priority>0.9</priority></url>
+  <url><loc>https://ahadorg.onrender.com/ai</loc><priority>0.9</priority></url>
+  <url><loc>https://ahadorg.onrender.com/ai.txt</loc><priority>0.9</priority></url>
+  <url><loc>https://ahadorg.onrender.com/health</loc><priority>0.8</priority></url>
+  <url><loc>https://ahadorg.onrender.com/guides</loc><priority>0.7</priority></url>
+  <url><loc>https://ahadorg.onrender.com/terms</loc><priority>0.6</priority></url>
+  <url><loc>https://ahadorg.onrender.com/docs</loc><priority>0.5</priority></url>
+  <url><loc>https://ahadorg.onrender.com/openapi.json</loc><priority>0.5</priority></url>
+</urlset>

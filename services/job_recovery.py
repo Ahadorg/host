@@ -299,6 +299,87 @@ def _recover_once_serial():
     return unresolved
 
 
+def _db_runner_map() -> dict:
+    """Runner job map from DB: runner_job_id -> {id, desired_state, worker_url, name}."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, runner_job_id, desired_state, worker_url, name FROM jobs "
+            "WHERE runner_job_id IS NOT NULL"
+        ).fetchall()
+        return {str(r["runner_job_id"]): dict(r) for r in rows}
+    except Exception:
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def reap_orphans() -> int:
+    """Kill runner jobs that DB no longer wants.
+
+    TWO cases that make \"deleted but still polling Telegram\" or \"stopped but
+    still running\" happen:
+
+      1. ORPHAN — fleet has a job id that no DB row points to any more (DELETE
+         while its runner was offline, so the runner DELETE never arrived).
+      2. STOPPED STALE — DB says desired_state='stopped' but fleet still shows
+         status=running (STOP while offline, so the polling process never got
+         killed).
+
+    Both are deleted/stopped on the runner that actually holds them. Best-effort
+    per job — one failing worker does not block the others. Returns how many
+    were reaped.
+    """
+    try:
+        live = runner_client.fleet_jobs(refresh=True)
+    except Exception as exc:
+        logger.debug("reaper: fleet unreachable (%s)", exc)
+        return 0
+    if not live:
+        return 0
+    db_map = _db_runner_map()
+    reaped = 0
+    for rid, info in list(live.items()):
+        worker = info.get("worker")
+        status = (info.get("status") or "").lower()
+        db_row = db_map.get(str(rid))
+        if db_row is None:
+            # No DB row → orphaned by a delete that missed this worker
+            logger.warning("reaper: orphan runner job %s on %s (no DB row) — deleting", rid, worker)
+            try:
+                runner_client._runner_http("DELETE", f"/internal/jobs/{rid}", worker=worker)
+                reaped += 1
+                _record_recovery_action({"id": rid, "name": info.get("name") or rid, "worker_url": worker},
+                                        "Orphan reaped",
+                                        f"Runner job {rid} had no DB row; deleted from {worker}.",
+                                        worker or "")
+            except Exception as exc:
+                logger.warning("reaper: delete failed for orphan %s on %s: %s", rid, worker, exc)
+            continue
+        if db_row.get("desired_state") == "stopped" and status == "running":
+            logger.warning("reaper: stale running job %s (DB stopped) on %s — stopping", rid, worker)
+            try:
+                # Prefer STOP (keeps workspace) but DELETE also ends polling
+                runner_client._runner_http("POST", f"/internal/jobs/{rid}/stop", worker=worker)
+                reaped += 1
+                _record_recovery_action(db_row, "Stale running job stopped",
+                                        f"DB says stopped but runner still running; stopped {rid} on {worker}.",
+                                        worker or "")
+            except Exception as exc:
+                logger.warning("reaper: stop failed for stale %s on %s: %s", rid, worker, exc)
+    if reaped:
+        logger.info("reaper: cleaned %d orphan/stale runner job(s)", reaped)
+        # Fleet cache is now stale (we just deleted jobs)
+        try:
+            runner_client._fleet_cache["jobs"] = None  # type: ignore
+        except Exception:
+            pass
+    return reaped
+
+
 AUTO_DEPLOY_INTERVAL_S = int(os.getenv("AUTO_DEPLOY_INTERVAL_S", "600") or "0")
 
 _auto_deploy_lock = threading.Lock()
@@ -430,6 +511,10 @@ def _reconcile_loop():
             recover_once()
         except Exception as exc:  # a sweep must never kill its own thread
             logger.warning("Bot recovery sweep crashed: %s", exc)
+        try:
+            reap_orphans()
+        except Exception as exc:
+            logger.warning("Reaper sweep crashed: %s", exc)
         try:
             # AFTER recovery, never instead of it: a runner that just restarted
             # has to get its jobs back before any of them is redeployed. The

@@ -1,0 +1,22 @@
+User-agent: *
+Allow: /
+
+# AI crawlers — full access to AI docs
+User-agent: GPTBot
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /ai.txt
+Allow: /ai
+Allow: /health
+Allow: /.well-known/ai.txt
+
+User-agent: ClaudeBot
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /ai.txt
+
+User-agent: CCBot
+Allow: /llms.txt
+Allow: /llms-full.txt
+
+Sitemap: https://ahadorg.onrender.com/sitemap.xml

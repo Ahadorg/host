@@ -34,7 +34,7 @@ def test_create_skips_suspended_runner_and_uses_next_healthy_one(monkeypatch):
     calls = []
     responses = [SuspendedResponse(), CreatedResponse()]
     monkeypatch.setattr(runner_client, "runner_pool", lambda: pool)
-    monkeypatch.setattr(runner_client, "_placement_order", lambda: pool)
+    monkeypatch.setattr(runner_client, "_placement_order", lambda *a, **k: pool)
     monkeypatch.setattr(runner_client, "_secret_for_runner", lambda _url: "test-secret")
 
     def request(method, url, **kwargs):

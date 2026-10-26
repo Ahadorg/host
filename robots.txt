@@ -1,0 +1,17 @@
+User-agent: *
+Allow: /
+
+User-agent: GPTBot
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /ai.txt
+Allow: /ai
+Allow: /health
+Allow: /.well-known/ai.txt
+
+User-agent: ClaudeBot
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /ai.txt
+
+Sitemap: https://ahadorg.onrender.com/sitemap.xml

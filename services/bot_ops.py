@@ -138,10 +138,10 @@ mem_limit_for = _mem_limit_for
 # whole project — assets, a vendored folder, a starter database. The runner
 # still enforces its own hard ceiling (ZIP_BUNDLE_CEILING_*), so these numbers
 # only decide what the site ASKS for on this account's behalf.
-ZIP_MAX_MB = int(os.getenv("ZIP_MAX_MB", "5"))
-ZIP_MAX_FILES = int(os.getenv("ZIP_MAX_FILES", "500"))
-QUEEN_ZIP_MAX_MB = int(os.getenv("QUEEN_ZIP_MAX_MB", "60"))
-QUEEN_ZIP_MAX_FILES = int(os.getenv("QUEEN_ZIP_MAX_FILES", "5000"))
+ZIP_MAX_MB = 5  # hard-coded (no env var) — queen gets the big box, see queen_runner_pins
+ZIP_MAX_FILES = 500
+QUEEN_ZIP_MAX_MB = 150  # heavy video projects need real room (runner ceiling is 200MB)
+QUEEN_ZIP_MAX_FILES = 8000
 
 
 def account_privileges(user_id: int) -> dict:
@@ -545,16 +545,20 @@ def _act(user_id: int, ref: str, verb: str) -> dict:
         # runner and replace the DB assignment instead of claiming success.
         return _cold_start(row)
 
-    # Stop is idempotent: a missing internal id is already stopped.
+    # Stop is idempotent: DB desired_state is the source of truth.
+    # Even when the runner is offline/waking we MARK STOPPED so the dashboard
+    # never stays green while the polling process is still alive elsewhere.
+    # The orphan reaper kills the live process when the worker answers again.
     if rid:
         try:
             response = runner_client._runner_http(
                 "POST", f"/internal/jobs/{rid}/stop", worker=_worker_of(row))
             if response.status_code not in (200, 404):
-                return {"ok": False, "error": f"Runner rejected stop (HTTP {response.status_code})."}
+                logger.warning("bot stop rejected for job %s: HTTP %s — marking stopped anyway",
+                               row.get("id"), response.status_code)
         except Exception as exc:
-            logger.warning("bot stop failed for job %s: %s", row.get("id"), exc)
-            return {"ok": False, "error": "The assigned runner did not answer. Try again shortly."}
+            logger.warning("bot stop unreachable for job %s: %s — marking stopped anyway",
+                           row.get("id"), exc)
     _set_assignment(row, rid, _worker_of(row), "stopped")
     return {"ok": True, "job": row}
 
@@ -857,14 +861,31 @@ def update_from_repo(user_id: int, ref: str, repo_url: str = None, entry=None,
     row = find_app(user_id, ref)
     if not row:
         return {"ok": False, "error": f"No app called “{ref}”. `/apps` lists yours."}
-    url = (repo_url or row.get("repo_url") or "").strip()
+    old_url = (row.get("repo_url") or "").strip()
+    url = (repo_url or old_url or "").strip()
     if not url:
         return {"ok": False,
                 "error": f"*{row['name']}* wasn't deployed from a repo, so there is "
                          f"no newer version to pull. `/update {row['name']}` and send "
                          f"the code or a `.zip` instead."}
+    # A NEW repo or branch was asked for: accept `owner/repo`, `github.com/...`,
+    # `/tree/<branch>` and `#<branch>`, and turn them into the https form the
+    # runner requires. The job id, folder and database stay exactly as they are.
+    changed_source = False
+    if repo_url and repo_url.strip():
+        from services import github_repo
+        o, r, b = github_repo.parse_repo(url)
+        if not o:
+            return {"ok": False,
+                    "error": "That doesn't look like a GitHub repo — expected "
+                             "`github.com/user/repo` or `user/repo/tree/branch`."}
+        url = github_repo.repo_url(o, r, b)
+        changed_source = url != old_url
     if entry is None:
-        entry = row.get("repo_entry") or ""
+        # The old entry file belongs to the old repo/branch; on a changed
+        # source let the runner detect it again instead of failing on a
+        # file that may not exist there.
+        entry = "" if changed_source else (row.get("repo_entry") or "")
     env = _row_env(row)
     rid = row.get("runner_job_id")
 

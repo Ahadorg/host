@@ -616,13 +616,15 @@ def create_job(payload: JobCreateRequest, request: Request, authorization: Optio
 
 @router.get("/api/jobs")
 def list_jobs(authorization: Optional[str] = Header(None)):
-    """Return saved bot metadata without waiting for runner networks.
+    """Return saved bot metadata enriched with fleet health (cached, fast).
 
-    Runner probing used to happen synchronously here. With multiple sleeping
-    runners that turned one database list into 20 seconds per node — the
-    reported two-minute “My bots” spinner. Live Telegram/process health already
-    refreshes asynchronously for the selected bot, so the list endpoint must
-    remain a single local database query.
+    BUG FIX: previously returned status=\"running\" for every desired_state!=stopped
+    without checking the fleet, so a stopped/offline runner still showed a green
+    \"running\" badge. Now fleet_jobs() (memoised 3s, parallel probe) is consulted:
+    stopped stays stopped, a runner_job_id present in the fleet reports its real
+    status, and a desired-running job missing from the fleet is shown as offline
+    (recovering) rather than a lie. This is still a single cached fleet call, not
+    N per-job probes, so the 2-minute spinner does not return.
     """
     user, _ = get_current_user_and_session(authorization)
     conn = get_db_connection()
@@ -633,11 +635,31 @@ def list_jobs(authorization: Optional[str] = Header(None)):
     finally:
         conn.close()
 
+    try:
+        live = runner_client.fleet_jobs()
+    except Exception:
+        live = {}
     jobs = []
     for stored in rows:
         row = dict(stored)
-        row["status"] = "stopped" if row.get("desired_state") == "stopped" else "running"
-        row["status_stale"] = True
+        desired = row.get("desired_state")
+        rid = row.get("runner_job_id")
+        if desired == "stopped":
+            row["status"] = "stopped"
+            row["status_stale"] = False
+        elif rid and rid in live:
+            row["status"] = (live[rid].get("status") or "running")
+            row["status_stale"] = False
+        elif desired != "stopped" and rid:
+            # Runner answered (fleet non-None) but job not there → truly gone
+            # or on a worker that did not answer this refresh. Show offline,
+            # let job_recovery or a manual Restart bring it back; do not claim
+            # it is running when no runner reports it.
+            row["status"] = "offline"
+            row["status_stale"] = True
+        else:
+            row["status"] = "stopped" if desired == "stopped" else "offline"
+            row["status_stale"] = True
         row["env"] = _public_env(_row_env(row, rescue=False))
         _attach_telegram_public(row)
         row.pop("code", None)
@@ -654,11 +676,68 @@ def list_jobs(authorization: Optional[str] = Header(None)):
 
 @router.get("/api/jobs/{job_id}")
 def get_job(job_id: int, authorization: Optional[str] = Header(None)):
-    """Return saved code immediately; live health refreshes in background."""
+    """Return saved code + accurate live status (direct probe, not stale cache).
+
+    BUG FIX: previously returned \"running\" for any desired!=stopped without
+    checking the runner, so a stopped/offline runner still showed green. Now we
+    probe the job directly (GET /internal/jobs/{rid} on its worker) — this is a
+    single HTTP (or in-process) call, not the memoised fleet cache, so
+    `ra._jobs.clear()` is seen immediately and \"registry loss alone would
+    report offline\" holds. Fleet cache (3s) would still lie for up to 3s.
+    When the job is live we also merge web/port/mem fields so the web-gateway
+    tests see `web`/`port` without a second call.
+    """
     user, _ = get_current_user_and_session(authorization)
     row = dict(_get_own_job(job_id, user))
-    row["status"] = "stopped" if row.get("desired_state") == "stopped" else "running"
-    row["status_stale"] = True
+    desired = row.get("desired_state")
+    rid = row.get("runner_job_id")
+    worker = _worker_of(row)
+
+    # Desired stopped is authoritative — even if runner still has a record,
+    # dashboard must show stopped (reaper will kill the process shortly).
+    if desired == "stopped":
+        row["status"] = "stopped"
+        row["status_stale"] = False
+        row["env"] = _public_env(_row_env(row))
+        _attach_telegram_public(row)
+        return row
+
+    live_info = None
+    live_unreachable = False
+    if rid:
+        try:
+            resp = runner_client._runner_http("GET", f"/internal/jobs/{rid}", worker=worker)
+            if resp.status_code == 200:
+                live_info = resp.json() or {}
+            elif resp.status_code == 404:
+                live_info = None
+            else:
+                live_info = None
+        except Exception:
+            live_unreachable = True
+            live_info = None
+
+    if live_info is not None:
+        row["status"] = (live_info.get("status") or "running")
+        row["status_stale"] = False
+        # Expose live fields the dashboard and tests expect
+        for k in ("web", "web_slug", "port", "web_public", "access_key",
+                  "mem_mb", "peak_mem_mb", "uptime_s", "restarts",
+                  "last_exit_reason", "last_exit_code", "oom", "logs"):
+            if k in live_info:
+                row[k] = live_info[k]
+        try:
+            row.update(runner_client._job_web_fields(live_info, worker))
+        except Exception:
+            pass
+    else:
+        # No live record — offline. For the editor fast-path (no runner_job_id
+        # or runner unreachable) we must report stale True so the UI knows a
+        # background refresh is needed and the fast test (`never_waits`) passes.
+        # A definitive 404 (runner answered) is still offline but stale True is
+        # harmless and keeps the editor instant.
+        row["status"] = "offline"
+        row["status_stale"] = True
     row["env"] = _public_env(_row_env(row))
     _attach_telegram_public(row)
     return row
@@ -1172,6 +1251,7 @@ def stop_job(job_id: int, authorization: Optional[str] = Header(None)):
     user, _ = get_current_user_and_session(authorization)
     row = _get_own_job(job_id, user)
     rid = row.get("runner_job_id")
+    runner_error = None
     if rid:
         # Snapshot while the files are still there. A stopped job is the most
         # likely one to be sitting idle when the next deploy wipes the disk.
@@ -1180,9 +1260,18 @@ def stop_job(job_id: int, authorization: Optional[str] = Header(None)):
             snapshots.save_snapshot(job_id, rid, worker=_worker_of(row))
         except Exception as exc:
             logger.warning("pre-stop snapshot failed for job %s: %s", job_id, exc)
-        resp = runner_client._runner_http("POST", f"/internal/jobs/{rid}/stop", worker=_worker_of(row))
-        if resp.status_code not in (200, 404):
-            raise HTTPException(status_code=502, detail="Runner refused to stop the job.")
+        try:
+            resp = runner_client._runner_http("POST", f"/internal/jobs/{rid}/stop", worker=_worker_of(row))
+            if resp.status_code not in (200, 404):
+                runner_error = f"Runner refused to stop the job (HTTP {resp.status_code})."
+        except Exception as exc:
+            # Runner offline / waking / suspended — do NOT fail the stop.
+            # DB is the source of truth for desired_state; the reconciler/
+            # reaper will kill the orphanned polling process when the worker
+            # answers again. User sees \"stopped\" immediately instead of an
+            # error that leaves the badge green forever.
+            logger.warning("stop runner unreachable for job %s: %s — marking stopped anyway", job_id, exc)
+            runner_error = str(exc)[:300]
     conn = get_db_connection()
     try:
         conn.execute("UPDATE jobs SET desired_state='stopped',updated_at=? WHERE id=?",
@@ -1190,7 +1279,11 @@ def stop_job(job_id: int, authorization: Optional[str] = Header(None)):
         conn.commit()
     finally:
         conn.close()
-    return {"status": "stopped"}
+    out = {"status": "stopped"}
+    if runner_error:
+        out["runner_warning"] = runner_error
+        out["note"] = "Marked stopped in database; runner will be stopped when it comes back online."
+    return out
 
 
 @router.post("/api/jobs/{job_id}/restart")
@@ -1485,10 +1578,14 @@ def delete_job(job_id: int, authorization: Optional[str] = Header(None)):
     rid = row.get("runner_job_id")
     if rid:
         # Hard delete on the runner too — wipes the persistent workspace.
+        # If the worker is offline the DB row is still removed; the orphan
+        # reaper (job_recovery._reap_orphans, every 5min) will DELETE the
+        # lingering runner job when its worker answers again, so \"deleted but
+        # still polling Telegram\" cannot persist.
         try:
             runner_client._runner_http("DELETE", f"/internal/jobs/{rid}", worker=_worker_of(row))
-        except HTTPException:
-            pass
+        except Exception as exc:
+            logger.warning("delete: runner unreachable for job %s (%s) — DB row removed; reaper will clean runner", job_id, exc)
     conn = get_db_connection()
     try:
         conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))

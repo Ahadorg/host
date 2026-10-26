@@ -656,6 +656,122 @@ def health():
 # ----------------------------
 
 
+# ── AI / LLM discovery — give ANY AI the URL and it understands the whole site ──
+# https://ahadorg.onrender.com/llms.txt  (concise)  and /llms-full.txt /ai.txt (full 38KB)
+# Also served at /.well-known/* for crawlers that look there.
+@app.get("/llms.txt", include_in_schema=False)
+def serve_llms_txt():
+    p = STATIC_DIR / "llms.txt"
+    if p.exists():
+        return FileResponse(p, media_type="text/plain; charset=utf-8", headers={"Cache-Control": "public, max-age=3600"})
+    return FileResponse(BASE_DIR / "llms.txt", media_type="text/plain; charset=utf-8")
+
+@app.get("/llms-full.txt", include_in_schema=False)
+def serve_llms_full():
+    p = STATIC_DIR / "llms-full.txt"
+    if p.exists():
+        return FileResponse(p, media_type="text/plain; charset=utf-8", headers={"Cache-Control": "public, max-age=3600"})
+    return FileResponse(BASE_DIR / "llms-full.txt", media_type="text/plain; charset=utf-8")
+
+@app.get("/ai.txt", include_in_schema=False)
+def serve_ai_txt():
+    p = STATIC_DIR / "ai.txt"
+    if p.exists():
+        return FileResponse(p, media_type="text/plain; charset=utf-8", headers={"Cache-Control": "public, max-age=3600"})
+    return FileResponse(BASE_DIR / "ai.txt", media_type="text/plain; charset=utf-8")
+
+@app.get("/ai", include_in_schema=False)
+def serve_ai_html():
+    # Full guide as HTML for humans + AI that fetches HTML — wraps llms-full.txt
+    p = STATIC_DIR / "llms-full.txt"
+    src = p.read_text(encoding="utf-8") if p.exists() else (BASE_DIR / "llms-full.txt").read_text(encoding="utf-8") if (BASE_DIR / "llms-full.txt").exists() else "AI docs not found."
+    # Minimal markdown → HTML (no deps): escape, then headings/bullets
+    import html as _h
+    escaped = _h.escape(src)
+    # crude heading: lines starting with # → <h1/h2>, else <pre>
+    lines = []
+    for ln in escaped.splitlines():
+        if ln.startswith("# "):
+            lines.append(f"<h1>{ln[2:]}</h1>")
+        elif ln.startswith("## "):
+            lines.append(f"<h2>{ln[3:]}</h2>")
+        elif ln.startswith("### "):
+            lines.append(f"<h3>{ln[4:]}</h3>")
+        elif ln.startswith("- ") or ln.startswith("* "):
+            lines.append(f"<li>{ln[2:]}</li>")
+        elif ln.strip() == "---":
+            lines.append("<hr/>")
+        elif ln.strip().startswith("```"):
+            lines.append("<pre>")
+        elif ln.strip() == "":
+            lines.append("<br/>")
+        else:
+            lines.append(f"<p>{ln}</p>")
+    body = "\n".join(lines)
+    html_doc = f"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>CodeNest — AI Guide — ahadorg.onrender.com</title>
+<meta name="description" content="Full AI documentation for CodeNest (ahadorg.onrender.com) — architecture, database schema, RAM management, code handling, API, security. Give this URL to any LLM."/>
+<link rel="alternate" type="text/plain" href="/llms.txt"/>
+<link rel="alternate" type="text/plain" href="/llms-full.txt"/>
+<style>
+body{{margin:0;font-family:system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif;max-width:900px;margin:0 auto;padding:24px;line-height:1.6;color:#0f172a;background:#fff}}
+h1{{font-size:1.5rem;border-bottom:2px solid #0ea5e9;padding-bottom:8px}}
+h2{{font-size:1.2rem;color:#0e7490;margin-top:28px;border-left:4px solid #06b6d4;padding-left:10px}}
+h3{{font-size:1rem;color:#334155}}
+pre{{background:#f1f5f9;padding:12px;overflow:auto;border-radius:8px;font-size:.88rem}}
+code{{background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:.9em}}
+hr{{border:none;border-top:1px solid #e2e8f0;margin:24px 0}}
+a{{color:#0284c7}}
+header{{background:#0f172a;color:#fff;padding:18px 20px;border-radius:12px;margin-bottom:18px}}
+header a{{color:#7dd3fc}}
+</style></head><body>
+<header><b>CodeNest — AI Guide</b> · <a href="/">ahadorg.onrender.com</a> · <a href="/llms.txt">llms.txt (concise)</a> · <a href="/llms-full.txt">llms-full.txt</a> · <a href="/health">health</a> · <a href="/openapi.json">openapi.json</a></header>
+{body}
+<hr/><p><small>Last updated 2026-10-03 · Serve with <code>Content-Type: text/plain</code> for LLM ingest. Also available at <code>/.well-known/ai.txt</code> and <code>/ai.txt</code>.</small></p>
+</body></html>"""
+    return HTMLResponse(html_doc, headers={"Cache-Control": "public, max-age=3600"})
+
+@app.get("/ai.json", include_in_schema=False)
+def serve_ai_json():
+    # Machine-readable manifest for programmatic AI
+    base = (os.getenv("SITE_BASE_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip() or "https://ahadorg.onrender.com").rstrip("/")
+    return {
+        "name": "CodeNest",
+        "url": base or "https://ahadorg.onrender.com",
+        "description": "Free Telegram bot hosting — paste Python/Node code, verify BOT_TOKEN, auto-install deps, 24/7 runner 512 MB, 3 bots free",
+        "ai_docs": [f"{base}/llms.txt", f"{base}/llms-full.txt", f"{base}/ai", f"{base}/ai.txt", f"{base}/health", f"{base}/openapi.json"],
+        "health": f"{base}/health",
+        "openapi": f"{base}/openapi.json",
+        "guides": f"{base}/guides",
+        "database_dialect": DIALECT,
+        "runner_mode": "embedded" if runner_client.embedded_mode() else "remote",
+        "languages": ["python","javascript","bash","ruby","php","go","java","lua","html"],
+        "limits": {"normal_zip_mb": 5, "normal_zip_files": 500, "queen_zip_mb": 150, "queen_zip_files": 8000, "queen_ram": "unlimited (exclusive 512 MB)", "free_bots": 3, "queen_bots": 10},
+        "endpoints": {"/llms.txt": "concise LLM guide", "/llms-full.txt": "full 38KB docs", "/ai": "HTML full", "/ai.txt": "plain full", "/health": "live diagnosis", "/openapi.json": "OpenAPI schema"},
+    }
+
+@app.get("/.well-known/ai.txt", include_in_schema=False)
+def serve_wellknown_ai():
+    p = STATIC_DIR / "ai.txt"
+    if p.exists():
+        return FileResponse(p, media_type="text/plain; charset=utf-8")
+    return FileResponse(BASE_DIR / "ai.txt", media_type="text/plain; charset=utf-8")
+
+@app.get("/robots.txt", include_in_schema=False)
+def serve_robots():
+    p = STATIC_DIR / "robots.txt"
+    if p.exists():
+        return FileResponse(p, media_type="text/plain; charset=utf-8")
+    return FileResponse(BASE_DIR / "robots.txt", media_type="text/plain; charset=utf-8") if (BASE_DIR / "robots.txt").exists() else HTMLResponse("User-agent: *\nAllow: /\n", media_type="text/plain")
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def serve_sitemap():
+    p = STATIC_DIR / "sitemap.xml"
+    if p.exists():
+        return FileResponse(p, media_type="application/xml; charset=utf-8")
+    return FileResponse(BASE_DIR / "sitemap.xml", media_type="application/xml; charset=utf-8") if (BASE_DIR / "sitemap.xml").exists() else HTMLResponse("<urlset/>", media_type="application/xml")
+
 @app.get("/terms", include_in_schema=False)
 def terms_page():
     if not TERMS_FILE.exists():

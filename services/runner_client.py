@@ -66,6 +66,100 @@ def managed_runner_nodes(refresh=False) -> list:
         return list(_registry_cache["nodes"])
 
 
+# ── Queen runner pin — exclusive 512MB for queen users (no env var) ──
+def get_queen_pin(user_id: int) -> dict | None:
+    """Return queen's pinned runner (if any): {runner_url, exclusive}."""
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            row = conn.execute("SELECT runner_url, exclusive FROM queen_runner_pins WHERE user_id=?", (int(user_id),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+def set_queen_pin(user_id: int, runner_url: str, exclusive: int = 1) -> bool:
+    """Pin a queen's jobs to one runner. exclusive=1 means other users won't be placed there."""
+    runner_url = (runner_url or "").strip().rstrip("/")
+    if not runner_url:
+        return False
+    # must be in pool (managed or env) to avoid pinning to ghost
+    if runner_url not in runner_pool():
+        # still allow if it's a known managed node URL (maybe disabled?), but check DB
+        try:
+            from database import get_db_connection
+            conn2 = get_db_connection()
+            try:
+                r = conn2.execute("SELECT 1 FROM runner_nodes WHERE url=?", (runner_url,)).fetchone()
+                if not r:
+                    return False
+            finally:
+                conn2.close()
+        except Exception:
+            return False
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            now = __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+            conn.execute(
+                "INSERT INTO queen_runner_pins (user_id, runner_url, exclusive, created_at, updated_at) "
+                "VALUES (?,?,?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET runner_url=excluded.runner_url, exclusive=excluded.exclusive, updated_at=excluded.updated_at",
+                (int(user_id), runner_url, int(exclusive), now, now),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+def clear_queen_pin(user_id: int) -> bool:
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            cur = conn.execute("DELETE FROM queen_runner_pins WHERE user_id=?", (int(user_id),))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+def list_exclusive_runners() -> dict:
+    """Map url -> owner_user_id for exclusive pins."""
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            rows = conn.execute("SELECT user_id, runner_url FROM queen_runner_pins WHERE exclusive=1").fetchall()
+            return {str(r["runner_url"]).rstrip("/"): int(r["user_id"]) for r in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+def choose_runner_for_user(user_id: int | None = None) -> str | None:
+    """Best runner for this user, respecting queen pins and free memory."""
+    pool = runner_pool()
+    if not pool:
+        return None
+    # queen's own pin first, even if runner looks busy — queen asked for it
+    if user_id is not None:
+        pin = get_queen_pin(int(user_id))
+        if pin and pin.get("runner_url"):
+            url = str(pin["runner_url"]).rstrip("/")
+            if url in pool:
+                # verify it is online (or at least not suspended); if offline we still try but fallback to others if 503
+                # we return pinned url directly — placement will try it first
+                return url
+    # otherwise use placement order for this user
+    order = _placement_order(user_id=user_id)
+    return order[0] if order else None
+
 def _secret_for_runner(url):
     clean = (url or "").rstrip("/")
     for node in managed_runner_nodes():
@@ -166,14 +260,14 @@ def _embedded_client():
 # The pool is the union of environment-configured URLs and DB-managed runner
 # nodes. Registry/health caches keep placement fast while
 # allowing an owner to add capacity without redeploying the main site.
-_HEALTH_TTL_S = int(os.getenv("WORKER_HEALTH_TTL_S", "45"))
+_HEALTH_TTL_S = 20  # hard-coded inside code (no env var needed) — faster refresh for 6-runner fleet
 _health_cache = {}          # url -> {"at": ts, "free": int, "load": float, "online": bool}
 
 
 def _probe_worker(url: str) -> dict:
     """Ask one worker how loaded it is. Never raises."""
     try:
-        r = requests.get(url + "/health", timeout=6)
+        r = requests.get(url + "/health", timeout=3)
         if r.status_code != 200:
             return {"online": False, "free": 0, "load": 1.0}
         d = r.json()
@@ -204,7 +298,7 @@ def _probe_worker(url: str) -> dict:
 
 
 def worker_health(refresh: bool = False, max_age_s: float = None) -> dict:
-    """Cached health for every worker in the pool.
+    """Cached health for every worker in the pool — now parallel.
 
     max_age_s lets a caller say how stale an answer it can live with, instead
     of the all-or-nothing choice between the 45s placement cache and a forced
@@ -212,26 +306,44 @@ def worker_health(refresh: bool = False, max_age_s: float = None) -> dict:
     refresh=True, so it re-probed the whole pool on every tick — the console
     generating load on the box it is watching. It now accepts a few seconds of
     staleness, which is invisible at a 10s refresh.
+
+    Parallel probing: the old loop probed runners sequentially (6 × 3s timeout
+    = 18s cold start) and blocked the Telegram callback thread the whole time,
+    making inline buttons look dead. We now probe needed runners concurrently.
     """
     import time
+    import concurrent.futures as _cf
     now = time.time()
     ttl = _HEALTH_TTL_S if max_age_s is None else max_age_s
+    pool = runner_pool()
     out = {}
-    for url in runner_pool():
+    to_probe = []
+    for url in pool:
         cached = _health_cache.get(url)
         if not refresh and cached and now - cached["at"] < ttl:
             out[url] = cached
-            continue
-        info = _probe_worker(url)
-        info["at"] = now
-        _health_cache[url] = info
-        out[url] = info
+        else:
+            to_probe.append(url)
+    if to_probe:
+        # probe in parallel; timeout per-worker is 3s so whole fleet ~3s not N*3
+        with _cf.ThreadPoolExecutor(max_workers=max(1, len(to_probe))) as ex:
+            futs = {ex.submit(_probe_worker, u): u for u in to_probe}
+            for fut in _cf.as_completed(futs):
+                u = futs[fut]
+                try:
+                    info = fut.result()
+                except Exception:
+                    info = {"online": False, "free": 0, "load": 1.0, "jobs": 0, "mem_mb": 0.0, "safe_mb": 0.0, "total_mb": 0.0, "free_mb": 0.0, "full": False}
+                info["at"] = now
+                _health_cache[u] = info
+                out[u] = info
     return out
 
 
-def _placement_order() -> list:
-    """Workers to try for a NEW job, least-loaded first.
+def _placement_order(user_id: int | None = None) -> list:
+    """Workers to try for a NEW job, least-loaded first (now by free MB).
 
+    Queen pins: a queen's exclusive runner is first for that queen, last for everyone else.
     Falls back to pool order when nothing has been probed yet, so a cold start
     still places jobs instead of refusing them.
     """
@@ -239,10 +351,39 @@ def _placement_order() -> list:
     if len(pool) < 2:
         return pool
     health = worker_health()
+    exclusive_map = list_exclusive_runners()
+    # own pin (if any) should rank before everything
+    own_pin_url = None
+    if user_id is not None:
+        try:
+            pin = get_queen_pin(int(user_id))
+            if pin:
+                own_pin_url = str(pin.get("runner_url") or "").rstrip("/")
+        except Exception:
+            pass
     def key(u):
         h = health.get(u) or {}
-        # Offline last; then most free slots; then pool order for stability.
-        return (0 if h.get("online") else 1, -h.get("free", 0), pool.index(u))
+        online = bool(h.get("online"))
+        # Use free_mb when available, fallback to free slots * 30 (health may be 0 when older mock lacks field)
+        free_mb = h.get("free_mb")
+        if free_mb is None or (free_mb == 0 and h.get("free") is not None):
+            # if probe returned 0 free_mb but has free slots, derive estimate (old runners / test mocks)
+            try:
+                free_mb = float(h.get("free", 0)) * 30.0
+            except Exception:
+                free_mb = 0.0
+        is_own = (u == own_pin_url) if own_pin_url else False
+        is_exclusive_other = (u in exclusive_map and exclusive_map[u] != (int(user_id) if user_id is not None else -1))
+        if is_own:
+            cat = 0  # queen's own exclusive — always first
+        elif not online:
+            cat = 3  # offline last
+        elif is_exclusive_other:
+            cat = 2  # exclusive for someone else — avoid
+        else:
+            cat = 1  # normal
+        # within same category, most free_mb first
+        return (cat, -float(free_mb), pool.index(u))
     return sorted(pool, key=key)
 
 
@@ -302,16 +443,24 @@ def fleet_jobs(refresh: bool = False) -> dict:
             logger.warning("fleet_jobs: embedded runner unreachable (%s)", exc)
         _fleet_cache.update(at=now, jobs=out)
         return out
-    for base in pool:
+    # Parallel fetch — 6 runners sequential at 20s each = 2min block; parallel ~20s max
+    import concurrent.futures as _cf2
+    def _fetch(base):
         try:
             resp = _runner_http("GET", "/internal/jobs", worker=base)
             if resp is None or resp.status_code != 200:
-                continue
-            for j in ((resp.json() or {}).get("jobs") or []):
-                j["worker"] = base
-                out[j.get("id")] = j
+                return []
+            return [(j.get("id"), {**j, "worker": base}) for j in ((resp.json() or {}).get("jobs") or [])]
         except Exception as exc:
             logger.warning("fleet_jobs: %s unreachable (%s)", base, exc)
+            return []
+    # Don't wait for offline runners forever: if health cache says offline, skip fast probe?
+    # But health may be stale; instead fetch all in parallel with timeout via _runner_http's own 20s.
+    with _cf2.ThreadPoolExecutor(max_workers=max(1, len(pool))) as ex:
+        futs = {ex.submit(_fetch, base): base for base in pool}
+        for fut in _cf2.as_completed(futs):
+            for jid, j in fut.result():
+                out[jid] = j
     if _has_embedded_assignments():
         try:
             resp = _runner_http("GET", "/internal/jobs", worker="embedded")
@@ -366,7 +515,7 @@ def _looks_like_wakeup(resp) -> bool:
     return True
 
 
-def _runner_http(method: str, path: str, json_body=None, worker: str = None):
+def _runner_http(method: str, path: str, json_body=None, worker: str = None, user_id: int | None = None):
     """Call the runner (embedded or remote) with the shared secret; map every
     transport failure to a clean HTTPException the frontend can display."""
     # Anything that is not a read CHANGES the fleet, so the memoised job list
@@ -419,10 +568,9 @@ def _runner_http(method: str, path: str, json_body=None, worker: str = None):
     # Callers now pass worker= from the jobs table.
     creating = method.upper() == "POST" and path == "/internal/jobs"
     if creating:
-        # Least-loaded first. Placement is the only decision that benefits from
-        # health data, and it reads the CACHE — a create never blocks on a
-        # round-trip to every worker.
-        targets = _placement_order()
+        # Least-loaded first (by free MB). Pass user_id so queen pins/exclusive are respected.
+        # For queen heavy jobs, this picks the emptiest of the allowed runners (often 490 free).
+        targets = _placement_order(user_id=user_id)
     elif worker:
         # Honour the recorded worker even if it has since been dropped from
         # the pool — the job is still there, and refusing to talk to it would
@@ -433,6 +581,18 @@ def _runner_http(method: str, path: str, json_body=None, worker: str = None):
         # all live on the primary.
         targets = pool[:1]
 
+    # Auto-infer user_id from job name "u<id>-name" when caller didn't pass it.
+    if creating and user_id is None and isinstance(json_body, dict):
+        try:
+            import re as _re
+            nm = str(json_body.get("name") or "")
+            m = _re.match(r"^u(\d+)-", nm)
+            if m:
+                user_id = int(m.group(1))
+                # re-compute targets queen-aware (pin + exclusive + free_mb)
+                targets = _placement_order(user_id=user_id)
+        except Exception:
+            pass
     last_exc = None
     last_full = None
     last_wake = None

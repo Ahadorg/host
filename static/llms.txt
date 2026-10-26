@@ -1,0 +1,100 @@
+# CodeNest — ahadorg.onrender.com — LLM Guide
+
+> CodeNest (ahadorg.onrender.com) is a free Render-hosted platform to deploy, host and manage Telegram bots 24/7 from Python/Node/Bash/Ruby/PHP code, ZIP bundles or public GitHub repos. Paste code → verify BOT_TOKEN via BotFather → auto-install deps → persistent 512 MB runner keeps process alive, restarts on crash, exposes live logs, public URL and snapshots. Three bots free forever.
+
+## Quick Summary for AI
+- **Site URL:** https://ahadorg.onrender.com  (also SITE_BASE_URL / RENDER_EXTERNAL_URL)
+- **Purpose:** Host Telegram bots as long-running processes (not serverless handlers)
+- **Stack:** FastAPI + vanilla JS (index.html SPA), SQLite locally / Postgres (Supabase) in prod, Docker on Render, in-process `httpx.AsyncClient` runner or remote runner pool
+- **Health:** `GET /health` → status, database dialect, runner mode, bot_secrets, telegram_bot, miniapp_url
+- **Full AI Docs:** https://ahadorg.onrender.com/ai  https://ahadorg.onrender.com/ai.txt  https://ahadorg.onrender.com/llms-full.txt
+- **OpenAPI:** https://ahadorg.onrender.com/openapi.json  Docs: https://ahadorg.onrender.com/docs
+- **GitHub Repo Import:** `/import owner/repo` or `/import owner/repo/tree/<branch>` — clones branch, detects entry, installs manifest
+- **Languages:** python, javascript/node, bash, ruby, php, go, java, lua, html/static — auto-detected via `_ENTRY_CANDIDATES` in `runner/app.py`
+
+## How It Works (2 steps, ~1 minute)
+1. **Choose / Paste** — template (7 curated bot products) or own code / ZIP / GitHub URL. Analysis detects framework (aiogram, python-telegram-bot, pyTelegramBotAPI/telebot, Telethon, Pyrogram, Telegraf, grammY, node-telegram-bot-api)
+2. **Connect & Deploy** — paste BotFather token → `/api/jobs` verify via `getMe` → `POST /internal/jobs` to runner → `mem_limit_mb`, `zip_max_mb/files`, `env` → runner `RLIMIT_AS`, `pip install`, spawn, stream logs, assign `web_slug` / public `https://…/live/{slug}/`
+
+## Architecture
+```
+Browser / Telegram Mini App / Telegram bot poller
+        ↓
+  Main FastAPI (app.py) — Postgres/SQLite, sessions, auth, snapshots
+        ↓  Bearer RUNNER_SERVICE_SECRET
+  Runner Pool (runner/app.py, Render free 512 MB each)
+     ├─ in-process httpx TestClient (embedded when RUNNER_SERVICE_URL empty)
+     └─ remote DB-managed runners (runner_nodes) + env pool
+        → /live/{slug} gateway, deploy, logs, isolation
+```
+
+- **Capacity:** each runner 512 MB → `MEM_SAFE_MB = total*0.82 ≈ 419 MB`, `free_mb = safe - used`, `free slots`, `load` — admission refuses if full (`X-Runner-Full` 503)
+- **Load Balancing:** `runner_client._placement_order(user_id)` → categories: 0 own-queen-pin, 1 normal-online `−free_mb`, 2 exclusive-other, 3 offline. Picks most-free; avoids queen-exclusive for others. Queen pin `queen_runner_pins(user_id PK, runner_url, exclusive)` — exclusive 512 MB alone.
+- **RAM Protection:** per-job `RLIMIT_AS` (`mem_limit_mb`), queen `0` = unlimited (no RLIMIT), box-level `_isolation_tick` culls fattest non-queen if `used_total > MEM_SAFE_MB`; queen never culled — logs warning instead. Heavy video ZIP queen `150 MB / 8000 files` (normal `5 MB / 500`).
+
+## Database (database.py → _SCHEMA_TABLES) — Postgres CITEXT or SQLite
+- **users**(id, username,email, password_hash, telegram_id, is_admin, is_suspended, can_upload_zip, mem_unlimited[queen], job_limit_override, fingerprint, agreed_terms_at, …)
+- **sessions**(id,user_id, token_hash, ip_address, fingerprint, last_seen, expires_at)
+- **jobs**(id,user_id, name, language, code, runner_job_id, worker_url, desired_state, env[plain JSON masked], telegram_bot_*, repo_url/repo_entry/repo_commit/auto_deploy, created_at…)
+- **runner_nodes**(id,label,url, encrypted_secret[JSON], enabled, created_by, …) + **queen_runner_pins** + **telegram_webhook_updates**(update_id, claimed_at, completed_at, payload) for durable queue
+- **broadcast_campaigns / broadcast_recipients**, **store_items**, **bot_revisions**, **admin_audit_log**, **abuse_reports**, **term_homes**, etc.
+- Secrets: plain JSON in `jobs.env` (masked everywhere), legacy `enc:v1:` Fernet migrated on boot via `secrets_store.migrate_job_envs()`, rescued from runner `job.json` via `env_rescue`
+
+## Code Handling (runner/app.py) — telebotcreator.com equivalent, REAL code
+- **Entry Detection:** `_detect_entry()` exact order `python main.py→app.py→bot.py→server.py→index.py→run.py | node index.js→server.js→app.js→main.js→bot.js | ruby app.rb→main.rb | php index.php | bash start.sh` + fallback largest `*.py` (`*.js` if package.json) at root. Respects `entry` param from GitHub scan.
+- **ZIP .zip Structure (EXPLICIT — GitHub-like):** runner extracts WHOLE zip preserving folders (zip-slip checked) into `DATA_DIR/jobs/{id}/`. Recommended flat: `main.py (+ requirements.txt at ROOT) + utils/helpers.py`; also allowed nested `src/bot.py + src/requirements.txt` (entry `src/bot.py`). Limits normal `5 MB/500` unzipped, queen `150 MB/8000`, ceiling `200 MB/20000`. Do NOT zip `__MACOSX`, dotfiles, hardcode BOT_TOKEN; include `requirements.txt` pinned. Create via `zip -r bot.zip . -x "__pycache__/*" ".git/*"` then `base64 -w0 bot.zip` → `POST /api/jobs {name, zip_b64, zip_max_mb}`. See `llms-full.txt §5` for full tree examples.
+- **GitHub Repo Structure (EXPLICIT):** same layout as ZIP but `git clone --depth 1 --branch <branch> https://github.com/o/r.git DATA_DIR/jobs/{id}/`. URL forms `owner/repo`, `/tree/<branch>`, `/blob/<branch>/file`, `#branch` — preserved, branch may contain slashes. Repo must be PUBLIC, must contain entry candidate at root or subfolder. Records `repo_commit` SHA + `repo_entry`; queen `auto_deploy` follows branch. Multi-project repo: use `entry=bot-a/bot.py` + `deps=["bot-a/requirements.txt"]` (≤4). See `llms-full.txt §5` for both layouts.
+- **Repo Clone:** `repo_url` → `git clone --branch` exact branch, records `commit`, installs root + up to 4 sub-project `requirements.txt`/`package.json`
+- **Deps:** scans imports → `pip install` / `npm install` inside job dir `DATA_DIR/jobs/{id}`; `pylibs` + `install_specs` re-checked on `/restart`
+- **Execution:** `subprocess.Popen` with `RLIMIT_AS`, `PORT` env, log `deque(2000)`, `peak_mem_mb`, `restarts`, `last_exit_reason`, snapshot restore on cold start
+
+## RAM Management Detail + Lifecycle Fix (Runner/Job still running bug)
+- `runner/app.py`: `TOTAL_MB` from `psutil`/`/proc/meminfo`, `MEM_SAFE_MB = int(total*0.82)`; `health()` reports `jobs, capacity, free, full, load, mem_mb/safe_mb/total_mb/free_mb`
+- `services/runner_client.py`: `worker_health(parallel ThreadPool, TTL 20s, 3s probe)` → `free_mb` drives placement; `fleet_jobs(parallel, memo FLEET_CACHE_MS 3000)` merges all workers; `_runner_http` retries `502/503/504` wakeups (`WAKE_RETRIES 2` × `4s`), respects `X-Runner-Full` rollover, suspend detection `"service suspended"`
+- `services/job_recovery.py`: `recover_background()` respawns `desired_state=running` jobs + `reap_orphans()` every 300s deletes fleet jobs not in DB (orphan) or DB `desired_state=stopped` but still `running` → fixes "Runner stopped / job deleted but bot still polls Telegram". `routes/runspace.py` now fleet-aware (`GET /api/jobs` no longer blind `running`), `POST stop` idempotent (marks DB stopped even when runner unreachable, reaper kills later). `services/bot_ops.py` same for Telegram stop.
+
+## Telegram Integration (services/pingbot.py)
+- **Link:** `/link` → `telegram_link` table `chat_id → user_id`; webhook `telegram_webhook_queue.TelegramWebhookQueue` (durable DB `telegram_webhook_updates`, 3 workers, `poll_s 0.8`, lease 300s, `answerCallbackQuery` immediate before work)
+- **Commands:** `/start /help /code /update /import /apps /status /logs /restart /stop /delete /rename /env /source /latest /autodeploy /projects /runner /limits /queen /admin` — `queen:runner/pin:auto|id:*`, `admin:health/runners` etc., all gated
+- **Queen:** `users.mem_unlimited` → no RLIMIT, 150 MB ZIP, `/projects` + `👑 Queen panel` (`/runner` picker), parallel health 20s cached
+- **Admin:** `/admin` inline `Health & how it works` (webhook, runners free_mb, jobs, recovery, GitHub), `Runners/Jobs/Users/Queens/Broadcast…` (neat grouped menu), 404-stealth for non-admins
+
+## API Routes (FastAPI include_router)
+- `routes/auth.py`: `/api/auth/*` signup/verify OTP (6-digit, Brevo), signin, forgot, Telegram widget `miniapp_auth`
+- `routes/runspace.py`: `GET /api/jobs`, `POST /api/jobs {name, language, code|zip_b64|repo_url, env, mem_limit}`, `GET/PATCH/DELETE /api/jobs/{id}`, `/api/jobs/{id}/restart|stop|logs|env|source|db|history|versions|rollback`
+- `routes/admin.py`: `GET /api/admin/*` overview, jobs, users, runners (`POST /api/admin/runners` verify `/health` + auth), abuse, audit
+- `routes/dashboard.py`, `code_editor.py`, `store.py`, `ping.py`, `term_proxy`, `proxy` (`/live/{slug}/*` WS+HTTP)
+- **Runner Internal:** `POST/GET/PATCH /internal/jobs`, `POST /internal/jobs/{id}/restart|stop`, `GET /health`, `GET /live/{slug}/*`
+
+## Security
+- Tokens masked (`***`), `BOT_TOKEN` write-only, fingerprint `token_fingerprint()` (`sha256_12`), duplicate-token block via fingerprint, proof TTL 15min single-use
+- Env stored plain JSON (owner DB), `legacy_rows`/`unreadable_rows` in `/health`, `env_rescue` from runner manifest
+- CORS `SITE_BASE_URL/RENDER_EXTERNAL_URL`, admin 404-stealth (`_is_admin_request`)
+
+## Env Vars
+- Required: `DATABASE_URL`, `SITE_BASE_URL` (or `RENDER_EXTERNAL_URL`), `RUNNER_SERVICE_URL` (empty=embedded), `RUNNER_SERVICE_SECRET`, `TELEGRAM_PING_BOT_TOKEN`, `ADMIN_EMAILS`, `BREVO_API_KEY`, `SENDER_EMAIL`
+- Optional: `QUEEN_PROJECTS_REPO/BRANCH/NAME`, `PING_DEFAULT_TARGET`, `DATA_DIR`, `DB_PATH` (dev)
+- Hard-coded now: `ZIP_MAX_MB 5`, `QUEEN_ZIP_MAX_MB 150`, `QUEEN_ZIP_MAX_FILES 8000`, `HEALTH_TTL 20s`
+
+## For AI — What to Write / How to Deploy (no mistakes)
+- **Python bot example:** read `BOT_TOKEN` from `os.getenv("BOT_TOKEN")` (never hardcode), `import telebot` or `from telegram import Update` etc., `bot.polling(none_stop=True)` or `Application.run_polling()`. Bind webhook via `PORT` if needed: `app.run(host="0.0.0.0", port=int(os.getenv("PORT",8000)))` → gets `https://…/live/{slug}/`
+- **ZIP:** include `requirements.txt` at root or subfolder, total unzipped ≤ limit; imports auto-detected, but explicit file helps speed
+- **GitHub:** any public repo, branch via `owner/repo/tree/<branch>`; runner clones exact commit, picks entry automatically
+- **Env:** set via dashboard Env tab or `PATCH /api/jobs/{id}/env` — never echo token, rotation via `rotate_runner_secret`
+- **Limits:** 3 jobs normal, queen 10 (`QUEEN_MAX_JOBS`), per-job RAM `MAX_MEM_MB` vs unlimited; queen gets exclusive runner (no other user placed there)
+- **Logs/Debug:** `GET /api/jobs/{id}/logs?lines=100`, runner `job.json` retains `peak_mem_mb`, `restarts`, `last_exit_reason`
+- **Do NOT:** hardcode token, assume `callback_query` without webhook `allowed_updates` containing it, use `localhost` for inter-service (use `worker_url`/`SITE_BASE`), exceed `ceilings` (200 MB ZIP), store secrets in code
+
+## Links for AI Crawlers
+- Human landing: https://ahadorg.onrender.com/
+- AI full guide: https://ahadorg.onrender.com/ai  | https://ahadorg.onrender.com/ai.txt
+- Detailed: https://ahadorg.onrender.com/llms-full.txt
+- Health (live): https://ahadorg.onrender.com/health
+- Guides cartoons: https://ahadorg.onrender.com/guides
+- OpenAPI: https://ahadorg.onrender.com/openapi.json
+- Terms: https://ahadorg.onrender.com/terms
+- Store: https://ahadorg.onrender.com/store
+- Repo: (private) see `README.md`, `STORE.md`, `TELEGRAM_JOB_DETECTION.md`, `JOB_URLS_AND_BOT_ANALYTICS.md`
+
+---
+*Generated for AI ingestion — last update 2026-10-03. Serve with `Content-Type: text/plain; charset=utf-8`. All paths above are real FastAPI routes in `app.py` + `routes/*.py` + `runner/app.py`.*
